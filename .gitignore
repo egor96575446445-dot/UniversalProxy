@@ -1,0 +1,9 @@
+proxy.log
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.spec
+build/
+dist/
+*.exe
