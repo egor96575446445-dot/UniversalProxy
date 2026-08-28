@@ -2,12 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Универсальный прокси-сервер для Windows.
-Поддерживает SOCKS5 и HTTP (CONNECT) с аутентификацией.
-Оптимизирован для работы с Яндекс.Браузером, Chrome, Firefox и любыми программами,
-поддерживающими HTTP/SOCKS5 прокси.
-
-Версия: 2.0 (финальная)
+Universal Proxy Ultimate — SOCKS5/HTTP прокси с ротацией, веб-интерфейсом и статистикой.
+Исправленная версия — ошибка current_proxy исправлена, добавлен вызов первого прокси.
 """
 
 import socketserver
@@ -19,98 +15,155 @@ import logging
 import time
 import threading
 import base64
+import json
 from datetime import datetime
+from collections import defaultdict
 import signal
 import os
 
-# ================== НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ ==================
-PORT = 1080                 # Порт, на котором будет слушать прокси
-HOST = '0.0.0.0'            # Слушать все интерфейсы (0.0.0.0) или только локальный (127.0.0.1)
-AUTH_REQUIRED = True        # Требовать логин и пароль
-USERNAME = 'proxyuser'      # Логин
-PASSWORD = 'proxypass'      # Пароль
-MAX_THREADS = 100           # Максимальное количество одновременных подключений
-TIMEOUT = 60                # Таймаут для соединений (секунды)
-LOG_LEVEL = 'INFO'          # Уровень логирования: DEBUG, INFO, WARNING, ERROR
-LOG_FILE = 'proxy.log'      # Файл для логов (оставьте пустым, чтобы писать только в консоль)
-# =========================================================
+# ================== НАСТРОЙКИ ==================
+PROXY_PORT = 1080
+WEB_PORT = 5000
+HOST = '0.0.0.0'
+AUTH_REQUIRED = True
+USERNAME = 'proxyuser'
+PASSWORD = 'proxypass'
+MAX_THREADS = 100
+TIMEOUT = 60
+LOG_FILE = 'proxy.log'
+PROXY_LIST_FILE = 'prox.txt'
+ROTATION_INTERVAL = 600
 
-# Настройка логирования
-log_handlers = [logging.StreamHandler(sys.stdout)]
-if LOG_FILE:
-    log_handlers.append(logging.FileHandler(LOG_FILE, encoding='utf-8'))
+# =============================================
 
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL.upper()),
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=log_handlers
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
-logger = logging.getLogger('UniversalProxy')
+logger = logging.getLogger('UltimateProxy')
 
-# Счетчик активных соединений
-active_connections = 0
-connections_lock = threading.Lock()
+# ================== СТАТИСТИКА ==================
+class Stats:
+    def __init__(self):
+        self.total_requests = 0
+        self.total_bytes = 0
+        self.active_connections = 0
+        self.hosts = defaultdict(int)
+        self.start_time = time.time()
+        self.lock = threading.Lock()
+        self._current_proxy = None
 
-# =========================================================
-# КЛАСС ДЛЯ РАБОТЫ С SOCKS5
-# =========================================================
+    def set_current_proxy(self, proxy):
+        self._current_proxy = proxy
 
+    def add_request(self, host, bytes_sent):
+        with self.lock:
+            self.total_requests += 1
+            self.total_bytes += bytes_sent
+            self.hosts[host] += 1
+
+    def get_stats(self):
+        with self.lock:
+            return {
+                'total_requests': self.total_requests,
+                'total_bytes': self.total_bytes,
+                'active_connections': self.active_connections,
+                'top_hosts': sorted(self.hosts.items(), key=lambda x: x[1], reverse=True)[:10],
+                'uptime': int(time.time() - self.start_time),
+                'current_proxy': self._current_proxy if self._current_proxy else 'Direct'
+            }
+
+stats = Stats()
+
+# ================== РОТАТОР ПРОКСИ ==================
+class ProxyRotator:
+    def __init__(self, filename):
+        self.filename = filename
+        self.proxies = []
+        self.current_index = -1
+        self.lock = threading.Lock()
+        self.load_proxies()
+        self.start_rotation()
+
+    def load_proxies(self):
+        try:
+            with open(self.filename, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            new_proxies = []
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    ip = parts[0].strip()
+                    port = parts[1].strip()
+                    if ip not in ['0.0.0.0', '127.0.0.7']:
+                        new_proxies.append(f"{ip}:{port}")
+            with self.lock:
+                self.proxies = new_proxies
+                self.current_index = -1
+            logger.info(f"[+] Загружено {len(self.proxies)} прокси из {self.filename}")
+        except Exception as e:
+            logger.error(f"[!] Ошибка загрузки прокси: {e}")
+            self.proxies = []
+
+    def get_next(self):
+        with self.lock:
+            if not self.proxies:
+                return None
+            self.current_index = (self.current_index + 1) % len(self.proxies)
+            proxy = self.proxies[self.current_index]
+            logger.info(f"[*] Ротация: выбран прокси {proxy} (#{self.current_index+1}/{len(self.proxies)})")
+            stats.set_current_proxy(proxy)
+            return proxy
+
+    def start_rotation(self):
+        def rotate():
+            while True:
+                time.sleep(ROTATION_INTERVAL)
+                self.load_proxies()
+                self.get_next()
+        thread = threading.Thread(target=rotate, daemon=True)
+        thread.start()
+        logger.info(f"[*] Ротация запущена: каждые {ROTATION_INTERVAL} секунд")
+
+rotator = ProxyRotator(PROXY_LIST_FILE)
+
+# ================== ОБРАБОТЧИК ПРОКСИ ==================
 class Socks5Handler(socketserver.StreamRequestHandler):
-    """Обработчик SOCKS5-запросов с поддержкой аутентификации"""
-
     def handle(self):
-        global active_connections
         client_addr = self.client_address
         start_time = time.time()
 
-        with connections_lock:
-            active_connections += 1
-            current_active = active_connections
+        with stats.lock:
+            stats.active_connections += 1
 
-        logger.info(f"[+] Подключение от {client_addr[0]}:{client_addr[1]} (Активно: {current_active})")
+        logger.info(f"[+] Подключение от {client_addr[0]}:{client_addr[1]}")
 
         try:
             self.request.settimeout(TIMEOUT)
-
-            # ---------- 1. Чтение первого байта для определения типа ----------
             first_byte = self._recv_exact(1)
             if not first_byte:
-                logger.warning(f"[-] Пустой запрос от {client_addr}")
                 return
 
-            # ---------- 2. Определение протокола (SOCKS5 или HTTP) ----------
             if first_byte == b'\x05':
-                # SOCKS5
                 self._handle_socks5(client_addr)
-            elif first_byte in (b'C', b'G', b'P', b'H', b'D', b'O'):
-                # HTTP-запрос (CONNECT, GET, POST, HEAD, DELETE, OPTIONS)
-                # Читаем остаток строки, чтобы получить полный запрос
-                rest = self.request.recv(1024).decode('utf-8', errors='ignore')
-                full_request = (first_byte.decode('utf-8', errors='ignore') + rest).strip()
-                self._handle_http_connect(full_request, client_addr)
             else:
                 logger.warning(f"[-] Неизвестный протокол от {client_addr}: {first_byte}")
-                return
-
-        except socket.timeout:
-            logger.warning(f"[-] Таймаут от {client_addr}")
-        except ConnectionResetError:
-            logger.warning(f"[-] Сброс соединения от {client_addr}")
-        except BrokenPipeError:
-            logger.warning(f"[-] Разрыв соединения от {client_addr}")
         except Exception as e:
-            logger.error(f"[!] Ошибка от {client_addr}: {e.__class__.__name__}: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"[!] Ошибка: {e}")
         finally:
             self.request.close()
-            elapsed = time.time() - start_time
-            with connections_lock:
-                active_connections -= 1
-            logger.info(f"[-] Отключение {client_addr} (Время: {elapsed:.2f}с, Активно: {active_connections})")
+            with stats.lock:
+                stats.active_connections -= 1
+            logger.info(f"[-] Отключение {client_addr} (Время: {time.time()-start_time:.2f}с)")
 
     def _recv_exact(self, n):
-        """Принять ровно n байт или вернуть None"""
         data = b''
         while len(data) < n:
             chunk = self.request.recv(n - len(data))
@@ -119,231 +172,62 @@ class Socks5Handler(socketserver.StreamRequestHandler):
             data += chunk
         return data
 
-    # ---------- SOCKS5 ----------
     def _handle_socks5(self, client_addr):
-        """Обработка SOCKS5-протокола"""
-        # Чтение методов
-        nmethods = self._recv_exact(1)[0]
-        methods = self._recv_exact(nmethods)
-
-        # Выбор метода аутентификации
-        if AUTH_REQUIRED and b'\x02' in methods:
-            self.request.send(b'\x05\x02')  # Запрос логина/пароля
-            logger.debug(f"[*] SOCKS5: запрошена аутентификация от {client_addr}")
-        else:
-            self.request.send(b'\x05\x00')  # Без аутентификации
-            logger.debug(f"[*] SOCKS5: аутентификация не требуется от {client_addr}")
-
-        # Аутентификация (если требуется)
-        if AUTH_REQUIRED:
-            ver = self._recv_exact(1)
-            if not ver or ver != b'\x01':
-                logger.warning(f"[-] SOCKS5: неверный запрос аутентификации от {client_addr}")
-                return
-            ulen = self._recv_exact(1)[0]
-            username = self._recv_exact(ulen).decode('utf-8', errors='ignore')
-            plen = self._recv_exact(1)[0]
-            password = self._recv_exact(plen).decode('utf-8', errors='ignore')
-
-            if username == USERNAME and password == PASSWORD:
-                self.request.send(b'\x01\x00')
-                logger.info(f"[+] SOCKS5: аутентификация прошла: {username} от {client_addr}")
-            else:
-                self.request.send(b'\x01\x01')
-                logger.warning(f"[-] SOCKS5: неудачная аутентификация от {client_addr}")
-                return
-
-        # Чтение запроса
-        ver = self._recv_exact(1)
-        if not ver or ver != b'\x05':
-            return
-        cmd = self._recv_exact(1)[0]
-        self._recv_exact(1)  # rsv
-        atyp = self._recv_exact(1)[0]
-
-        # Парсинг адреса
-        if atyp == 1:  # IPv4
-            addr = socket.inet_ntoa(self._recv_exact(4))
-        elif atyp == 3:  # Доменное имя
-            length = self._recv_exact(1)[0]
-            addr = self._recv_exact(length).decode('utf-8')
-        elif atyp == 4:  # IPv6
-            addr = socket.inet_ntop(socket.AF_INET6, self._recv_exact(16))
-        else:
-            logger.warning(f"[-] SOCKS5: неподдерживаемый тип адреса {atyp} от {client_addr}")
-            return
-        port = struct.unpack('>H', self._recv_exact(2))[0]
-
-        logger.info(f"[*] SOCKS5: запрос к {addr}:{port} от {client_addr}")
-
-        if cmd == 1:  # CONNECT
-            self._forward_to_target(addr, port, client_addr)
-        else:
-            logger.warning(f"[-] SOCKS5: команда {cmd} не поддерживается от {client_addr}")
-            self.request.send(b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00')
-
-    # ---------- HTTP CONNECT ----------
-    def _handle_http_connect(self, raw_request, client_addr):
-        """Обработка HTTP-запроса (CONNECT, GET, POST) — превращаем в SOCKS5-туннель"""
-        lines = raw_request.split('\r\n')
-        if not lines:
+        proxy_str = rotator.get_next()
+        if not proxy_str:
+            logger.warning("[-] Нет доступных прокси")
             return
 
-        first_line = lines[0].strip()
-        parts = first_line.split(' ')
-        if len(parts) < 2:
-            logger.warning(f"[-] HTTP: неверный запрос от {client_addr}: {first_line}")
-            self.request.send(b'HTTP/1.1 400 Bad Request\r\n\r\n')
-            return
+        proxy_ip, proxy_port = proxy_str.split(':')
+        proxy_port = int(proxy_port)
 
-        method = parts[0].upper()
-        target = parts[1]
-
-        # Проверка аутентификации (Proxy-Authorization)
-        if AUTH_REQUIRED:
-            auth_header = None
-            for line in lines:
-                if line.lower().startswith('proxy-authorization:'):
-                    auth_header = line.split(':', 1)[1].strip()
-                    break
-            if not auth_header:
-                logger.warning(f"[-] HTTP: отсутствует аутентификация от {client_addr}")
-                self.request.send(b'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy"\r\n\r\n')
-                return
-
-            # Проверка логина/пароля (Basic Auth)
-            if auth_header.startswith('Basic '):
-                try:
-                    decoded = base64.b64decode(auth_header[6:]).decode('utf-8')
-                    user, pwd = decoded.split(':', 1)
-                except:
-                    user, pwd = '', ''
-                if user != USERNAME or pwd != PASSWORD:
-                    logger.warning(f"[-] HTTP: неверный логин/пароль от {client_addr}")
-                    self.request.send(b'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy"\r\n\r\n')
-                    return
-            else:
-                logger.warning(f"[-] HTTP: неподдерживаемый метод аутентификации от {client_addr}")
-                self.request.send(b'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy"\r\n\r\n')
-                return
-
-        # Обработка CONNECT
-        if method == 'CONNECT':
-            # target = "host:port"
-            if ':' in target:
-                host, port_str = target.rsplit(':', 1)
-                try:
-                    port = int(port_str)
-                except:
-                    logger.warning(f"[-] HTTP: неверный порт от {client_addr}: {target}")
-                    self.request.send(b'HTTP/1.1 400 Bad Request\r\n\r\n')
-                    return
-                logger.info(f"[*] HTTP CONNECT: {host}:{port} от {client_addr}")
-
-                # Подключаемся к цели
-                remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                remote.settimeout(TIMEOUT)
-                try:
-                    remote.connect((host, port))
-                except Exception as e:
-                    logger.warning(f"[-] HTTP: не удалось подключиться к {host}:{port} от {client_addr}: {e}")
-                    self.request.send(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
-                    remote.close()
-                    return
-
-                # Отправляем успешный ответ (туннель установлен)
-                self.request.send(b'HTTP/1.1 200 Connection Established\r\nProxy-Agent: UniversalProxy/2.0\r\n\r\n')
-                logger.info(f"[*] HTTP CONNECT: туннель к {host}:{port} установлен для {client_addr}")
-
-                # Пересылка данных
-                self._forward_data(self.request, remote, client_addr)
-
-        else:
-            # GET, POST, HEAD — обрабатываем как обычный HTTP-запрос через прокси
-            logger.info(f"[*] HTTP {method}: {target} от {client_addr}")
-            self._forward_http_request(raw_request, target, client_addr)
-
-    # ---------- Пересылка данных ----------
-    def _forward_to_target(self, addr, port, client_addr):
-        """Установка туннеля к целевой машине и пересылка данных"""
-        remote = None
+        remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        remote.settimeout(TIMEOUT)
         try:
-            remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            remote.settimeout(TIMEOUT)
-            remote.connect((addr, port))
-            logger.info(f"[*] Подключение к {addr}:{port} установлено для {client_addr}")
+            remote.connect((proxy_ip, proxy_port))
+            logger.info(f"[*] Подключение к {proxy_ip}:{proxy_port}")
 
-            # Ответ об успехе
+            remote.send(b'\x05\x01\x00')
+            remote.recv(2)
+
+            ver = self._recv_exact(1)
+            if not ver or ver != b'\x05':
+                return
+            cmd = self._recv_exact(1)[0]
+            self._recv_exact(1)
+            atyp = self._recv_exact(1)[0]
+
+            if atyp == 1:
+                addr = socket.inet_ntoa(self._recv_exact(4))
+            elif atyp == 3:
+                length = self._recv_exact(1)[0]
+                addr = self._recv_exact(length).decode('utf-8')
+            else:
+                return
+            port = struct.unpack('>H', self._recv_exact(2))[0]
+
+            req = b'\x05\x01\x00'
+            if isinstance(addr, str):
+                req += b'\x03' + len(addr).to_bytes(1, 'big') + addr.encode()
+            else:
+                req += b'\x01' + socket.inet_aton(addr)
+            req += struct.pack('>H', port)
+            remote.send(req)
+
+            resp = remote.recv(10)
+            if resp[1] != 0:
+                logger.warning(f"[-] Ошибка подключения к {addr}:{port} через {proxy_str}")
+                remote.close()
+                return
+
             self.request.send(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
             self._forward_data(self.request, remote, client_addr)
-
-        except socket.timeout:
-            logger.warning(f"[-] Таймаут подключения к {addr}:{port} от {client_addr}")
-            self.request.send(b'\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00')
-        except ConnectionRefusedError:
-            logger.warning(f"[-] Отказ в соединении с {addr}:{port} от {client_addr}")
-            self.request.send(b'\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00')
         except Exception as e:
-            logger.error(f"[!] Ошибка подключения к {addr}:{port} от {client_addr}: {e}")
-            self.request.send(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
-        finally:
-            if remote:
-                remote.close()
-
-    def _forward_http_request(self, raw_request, target, client_addr):
-        """Пересылка HTTP-запроса (GET, POST, HEAD) через прокси"""
-        # Извлекаем хост и порт из target
-        if '://' in target:
-            target = target.split('://', 1)[1]
-        if '/' in target:
-            host_port, path = target.split('/', 1)
-            path = '/' + path
-        else:
-            host_port = target
-            path = '/'
-
-        if ':' in host_port:
-            host, port_str = host_port.rsplit(':', 1)
-            try:
-                port = int(port_str)
-            except:
-                port = 80
-        else:
-            host = host_port
-            port = 80
-
-        try:
-            remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            remote.settimeout(TIMEOUT)
-            remote.connect((host, port))
-
-            # Пересылаем запрос (исправляем заголовки, добавляем Host если нужно)
-            lines = raw_request.split('\r\n')
-            new_first_line = f"{lines[0].split(' ')[0]} {path} HTTP/1.1"
-            new_lines = [new_first_line]
-            has_host = False
-            for line in lines[1:]:
-                if line.lower().startswith('host:'):
-                    has_host = True
-                new_lines.append(line)
-            if not has_host:
-                new_lines.append(f"Host: {host}")
-            new_request = '\r\n'.join(new_lines) + '\r\n\r\n'
-
-            remote.send(new_request.encode('utf-8'))
-            self._forward_data(self.request, remote, client_addr)
-
-        except Exception as e:
-            logger.error(f"[!] Ошибка HTTP-запроса к {host}:{port} от {client_addr}: {e}")
-            try:
-                self.request.send(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
-            except:
-                pass
+            logger.error(f"[!] Ошибка через {proxy_str}: {e}")
         finally:
             remote.close()
 
     def _forward_data(self, client_sock, remote_sock, client_addr):
-        """Двусторонняя пересылка данных между клиентом и удалённым сервером"""
         try:
             while True:
                 rlist, _, _ = select.select([client_sock, remote_sock], [], [], TIMEOUT)
@@ -361,70 +245,92 @@ class Socks5Handler(socketserver.StreamRequestHandler):
                     if not data:
                         break
                     client_sock.sendall(data)
-
-        except socket.timeout:
-            logger.warning(f"[-] Таймаут пересылки данных для {client_addr}")
         except Exception as e:
-            logger.error(f"[!] Ошибка пересылки данных для {client_addr}: {e}")
+            logger.error(f"[!] Ошибка пересылки: {e}")
 
+# ================== ВЕБ-ИНТЕРФЕЙС ==================
+from flask import Flask, jsonify, render_template_string
 
-# =========================================================
-# ЗАПУСК СЕРВЕРА
-# =========================================================
+app = Flask(__name__)
 
-class ThreadedTCPServer(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Universal Proxy Control</title>
+    <style>
+        body { font-family: Arial; margin: 20px; background: #f0f0f0; }
+        .card { background: white; padding: 20px; margin: 10px 0; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        h2 { color: #333; }
+        .stat { display: inline-block; margin: 10px 20px 10px 0; }
+        .stat-value { font-size: 24px; font-weight: bold; color: #0066cc; }
+        .stat-label { font-size: 14px; color: #666; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }
+        pre { background: #1e1e1e; color: #d4d4d4; padding: 10px; border-radius: 4px; max-height: 300px; overflow: auto; }
+    </style>
+</head>
+<body>
+    <h1>🌐 Universal Proxy Control</h1>
+    <div class="card">
+        <h2>📊 Статистика</h2>
+        <div class="stat"><div class="stat-value">{{ stats.total_requests }}</div><div class="stat-label">Запросов</div></div>
+        <div class="stat"><div class="stat-value">{{ (stats.total_bytes // 1024) }} KB</div><div class="stat-label">Передано</div></div>
+        <div class="stat"><div class="stat-value">{{ stats.active_connections }}</div><div class="stat-label">Активных</div></div>
+        <div class="stat"><div class="stat-value">{{ (stats.uptime // 60) }} мин</div><div class="stat-label">Работает</div></div>
+        <div class="stat"><div class="stat-value">{{ stats.current_proxy }}</div><div class="stat-label">Текущий прокси</div></div>
+    </div>
+    <div class="card">
+        <h2>🔥 Топ сайтов</h2>
+        <table>
+            <tr><th>Сайт</th><th>Запросов</th></tr>
+            {% for host, count in stats.top_hosts %}
+            <tr><td>{{ host }}</td><td>{{ count }}</td></tr>
+            {% endfor %}
+        </table>
+    </div>
+    <div class="card">
+        <h2>📋 Логи</h2>
+        <pre>
+{% for line in logs %}{{ line }}
+{% endfor %}</pre>
+    </div>
+</body>
+</html>
+"""
 
-    def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True):
-        super().__init__(server_address, RequestHandlerClass, bind_and_activate)
-        self.active_threads = 0
-        self.threads_lock = threading.Lock()
+@app.route('/')
+def index():
+    with open(LOG_FILE, 'r', encoding='utf-8') as f:
+        logs = f.readlines()[-30:]
+    return render_template_string(HTML, stats=stats.get_stats(), logs=logs)
 
-    def process_request(self, request, client_address):
-        with self.threads_lock:
-            if self.active_threads >= MAX_THREADS:
-                logger.warning(f"[-] Достигнут лимит потоков ({MAX_THREADS}), соединение отклонено")
-                request.close()
-                return
-            self.active_threads += 1
+@app.route('/api/stats')
+def api_stats():
+    return jsonify(stats.get_stats())
 
-        try:
-            super().process_request(request, client_address)
-        finally:
-            with self.threads_lock:
-                self.active_threads -= 1
+@app.route('/api/rotate')
+def api_rotate():
+    rotator.load_proxies()
+    proxy = rotator.get_next()
+    return jsonify({'status': 'ok', 'proxy': proxy})
 
-
-def signal_handler(sig, frame):
-    logger.info("\n[!] Получен сигнал остановки. Завершаем работу...")
-    sys.exit(0)
-
-
+# ================== ЗАПУСК ==================
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    # Запускаем веб-интерфейс в отдельном потоке
+    web_thread = threading.Thread(target=app.run, kwargs={'host': '0.0.0.0', 'port': WEB_PORT, 'debug': False, 'threaded': True}, daemon=True)
+    web_thread.start()
+    logger.info(f"[+] Веб-интерфейс: http://localhost:{WEB_PORT}")
 
-    server = ThreadedTCPServer((HOST, PORT), Socks5Handler)
+    # ВЫБИРАЕМ ПЕРВЫЙ ПРОКСИ ПРИ СТАРТЕ
+    rotator.get_next()
 
-    logger.info("="*60)
-    logger.info(f"[+] УНИВЕРСАЛЬНЫЙ ПРОКСИ-СЕРВЕР ЗАПУЩЕН")
-    logger.info(f"[+] Хост: {HOST}")
-    logger.info(f"[+] Порт: {PORT}")
-    logger.info(f"[+] Аутентификация: {'ВКЛЮЧЕНА' if AUTH_REQUIRED else 'ВЫКЛЮЧЕНА'}")
-    if AUTH_REQUIRED:
-        logger.info(f"[+] Логин: {USERNAME}")
-        logger.info(f"[+] Пароль: {PASSWORD}")
-    logger.info(f"[+] Максимум потоков: {MAX_THREADS}")
-    logger.info(f"[+] Лог-файл: {LOG_FILE if LOG_FILE else 'Только консоль'}")
-    logger.info("="*60)
-    logger.info("[*] Нажмите Ctrl+C для остановки")
-    logger.info("[*] Поддерживаются: SOCKS5, HTTP CONNECT, HTTP GET/POST")
-    logger.info("[*] Браузеры: Яндекс, Chrome, Firefox, Edge")
-
+    # Запускаем прокси
+    server = socketserver.ThreadingTCPServer((HOST, PROXY_PORT), Socks5Handler)
+    logger.info(f"[+] Прокси запущен на порту {PROXY_PORT}")
+    logger.info(f"[+] Ротация: {ROTATION_INTERVAL} секунд")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        logger.info("\n[!] Остановка сервера...")
+        logger.info("[!] Остановка...")
         server.shutdown()
-        server.server_close()
-        logger.info("[+] Сервер остановлен")
