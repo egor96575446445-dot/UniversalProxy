@@ -2,14 +2,11 @@
 __pycache__/
 *.py[cod]
 
-# Local VPN material and secrets
-*.key
-*.crt
-*.pem
-configs/*.ovpn
-
-# Runtime files
-proxy.log
-*.log
+# Virtual env
 .venv/
 venv/
+
+# Local config
+configs/
+*.ovpn
+*.key
