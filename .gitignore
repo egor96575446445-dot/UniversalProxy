@@ -1,9 +1,15 @@
-proxy.log
+# Bytecode
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.spec
-build/
-dist/
-*.exe
+*.py[cod]
+
+# Local VPN material and secrets
+*.key
+*.crt
+*.pem
+configs/*.ovpn
+
+# Runtime files
+proxy.log
+*.log
+.venv/
+venv/

@@ -1,0 +1,1 @@
+"""BratikVPN application package."""

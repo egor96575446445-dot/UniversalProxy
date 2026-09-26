@@ -1,0 +1,8 @@
+[
+  {
+    "name": "Пример сервера",
+    "country": "Добавьте конфигурацию",
+    "config": "configs/example.ovpn",
+    "protocol": "OpenVPN"
+  }
+]
