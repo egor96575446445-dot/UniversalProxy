@@ -3,23 +3,20 @@
 
 """
 Universal Proxy Ultimate — SOCKS5/HTTP прокси с ротацией, веб-интерфейсом и статистикой.
-Исправленная версия — ошибка current_proxy исправлена, добавлен вызов первого прокси.
+Улучшенная версия: добавлена проверка аутентификации, поддержка HTTP CONNECT,
+безопасные проверки входных данных и более чистая обработка ошибок.
 """
 
-import socketserver
-import socket
-import struct
-import select
-import sys
-import logging
-import time
-import threading
 import base64
-import json
-from datetime import datetime
+import logging
+import select
+import socket
+import socketserver
+import struct
+import sys
+import threading
+import time
 from collections import defaultdict
-import signal
-import os
 
 # ================== НАСТРОЙКИ ==================
 PROXY_PORT = 1080
@@ -45,6 +42,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('UltimateProxy')
+
 
 # ================== СТАТИСТИКА ==================
 class Stats:
@@ -77,7 +75,35 @@ class Stats:
                 'current_proxy': self._current_proxy if self._current_proxy else 'Direct'
             }
 
+
 stats = Stats()
+
+
+# ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
+def parse_proxy_entry(line):
+    if not line or not line.strip():
+        return None
+
+    parts = line.strip().split()
+    if len(parts) < 2:
+        return None
+
+    ip = parts[0].strip()
+    port_str = parts[1].strip()
+
+    try:
+        port = int(port_str)
+    except ValueError:
+        return None
+
+    if not ip or ip in {'0.0.0.0', '127.0.0.7'}:
+        return None
+
+    if port <= 0 or port > 65535:
+        return None
+
+    return f"{ip}:{port}"
+
 
 # ================== РОТАТОР ПРОКСИ ==================
 class ProxyRotator:
@@ -93,20 +119,17 @@ class ProxyRotator:
         try:
             with open(self.filename, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
+
             new_proxies = []
             for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split()
-                if len(parts) >= 2:
-                    ip = parts[0].strip()
-                    port = parts[1].strip()
-                    if ip not in ['0.0.0.0', '127.0.0.7']:
-                        new_proxies.append(f"{ip}:{port}")
+                proxy = parse_proxy_entry(line)
+                if proxy:
+                    new_proxies.append(proxy)
+
             with self.lock:
                 self.proxies = new_proxies
-                self.current_index = -1
+                self.current_index = -1 if new_proxies else -1
+
             logger.info(f"[+] Загружено {len(self.proxies)} прокси из {self.filename}")
         except Exception as e:
             logger.error(f"[!] Ошибка загрузки прокси: {e}")
@@ -116,9 +139,10 @@ class ProxyRotator:
         with self.lock:
             if not self.proxies:
                 return None
+
             self.current_index = (self.current_index + 1) % len(self.proxies)
             proxy = self.proxies[self.current_index]
-            logger.info(f"[*] Ротация: выбран прокси {proxy} (#{self.current_index+1}/{len(self.proxies)})")
+            logger.info(f"[*] Ротация: выбран прокси {proxy} (#{self.current_index + 1}/{len(self.proxies)})")
             stats.set_current_proxy(proxy)
             return proxy
 
@@ -127,107 +151,71 @@ class ProxyRotator:
             while True:
                 time.sleep(ROTATION_INTERVAL)
                 self.load_proxies()
-                self.get_next()
+                if self.proxies:
+                    self.get_next()
+
         thread = threading.Thread(target=rotate, daemon=True)
         thread.start()
         logger.info(f"[*] Ротация запущена: каждые {ROTATION_INTERVAL} секунд")
 
+
 rotator = ProxyRotator(PROXY_LIST_FILE)
 
-# ================== ОБРАБОТЧИК ПРОКСИ ==================
-class Socks5Handler(socketserver.StreamRequestHandler):
-    def handle(self):
-        client_addr = self.client_address
-        start_time = time.time()
 
-        with stats.lock:
-            stats.active_connections += 1
+# ================== ОБРАБОТЧИКИ ПРОТОКОЛОВ ==================
+def read_exact(sock, n):
+    data = bytearray()
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            return None
+        data.extend(chunk)
+    return bytes(data)
 
-        logger.info(f"[+] Подключение от {client_addr[0]}:{client_addr[1]}")
 
-        try:
-            self.request.settimeout(TIMEOUT)
-            first_byte = self._recv_exact(1)
-            if not first_byte:
-                return
-
-            if first_byte == b'\x05':
-                self._handle_socks5(client_addr)
-            else:
-                logger.warning(f"[-] Неизвестный протокол от {client_addr}: {first_byte}")
-        except Exception as e:
-            logger.error(f"[!] Ошибка: {e}")
-        finally:
-            self.request.close()
-            with stats.lock:
-                stats.active_connections -= 1
-            logger.info(f"[-] Отключение {client_addr} (Время: {time.time()-start_time:.2f}с)")
-
-    def _recv_exact(self, n):
-        data = b''
-        while len(data) < n:
-            chunk = self.request.recv(n - len(data))
-            if not chunk:
-                return None
-            data += chunk
-        return data
-
-    def _handle_socks5(self, client_addr):
+class ProxyTunnel:
+    @staticmethod
+    def connect_upstream():
         proxy_str = rotator.get_next()
         if not proxy_str:
-            logger.warning("[-] Нет доступных прокси")
-            return
+            raise RuntimeError('Нет доступных прокси в prox.txt')
 
-        proxy_ip, proxy_port = proxy_str.split(':')
+        proxy_ip, proxy_port = proxy_str.split(':', 1)
         proxy_port = int(proxy_port)
 
         remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         remote.settimeout(TIMEOUT)
-        try:
-            remote.connect((proxy_ip, proxy_port))
-            logger.info(f"[*] Подключение к {proxy_ip}:{proxy_port}")
+        remote.connect((proxy_ip, proxy_port))
 
-            remote.send(b'\x05\x01\x00')
-            remote.recv(2)
+        logger.info(f"[*] Подключение к upstream {proxy_ip}:{proxy_port}")
 
-            ver = self._recv_exact(1)
-            if not ver or ver != b'\x05':
-                return
-            cmd = self._recv_exact(1)[0]
-            self._recv_exact(1)
-            atyp = self._recv_exact(1)[0]
+        remote.sendall(b'\x05\x01\x00')
+        greeting = read_exact(remote, 2)
+        if not greeting or greeting != b'\x05\x00':
+            raise RuntimeError(f'Не удалось установить SOCKS5 handshake с upstream {proxy_str}')
 
-            if atyp == 1:
-                addr = socket.inet_ntoa(self._recv_exact(4))
-            elif atyp == 3:
-                length = self._recv_exact(1)[0]
-                addr = self._recv_exact(length).decode('utf-8')
-            else:
-                return
-            port = struct.unpack('>H', self._recv_exact(2))[0]
+        return remote, proxy_str
 
-            req = b'\x05\x01\x00'
-            if isinstance(addr, str):
-                req += b'\x03' + len(addr).to_bytes(1, 'big') + addr.encode()
-            else:
-                req += b'\x01' + socket.inet_aton(addr)
-            req += struct.pack('>H', port)
-            remote.send(req)
+    @staticmethod
+    def socks5_connect(remote, host, port):
+        if isinstance(host, str):
+            host_bytes = host.encode('utf-8')
+            req = b'\x05\x01\x00\x03' + bytes([len(host_bytes)]) + host_bytes + struct.pack('>H', port)
+        else:
+            req = b'\x05\x01\x00\x01' + socket.inet_aton(host) + struct.pack('>H', port)
 
-            resp = remote.recv(10)
-            if resp[1] != 0:
-                logger.warning(f"[-] Ошибка подключения к {addr}:{port} через {proxy_str}")
-                remote.close()
-                return
+        remote.sendall(req)
+        resp = read_exact(remote, 10)
+        if not resp:
+            raise RuntimeError('Нет ответа от upstream SOCKS5-сервера')
 
-            self.request.send(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
-            self._forward_data(self.request, remote, client_addr)
-        except Exception as e:
-            logger.error(f"[!] Ошибка через {proxy_str}: {e}")
-        finally:
-            remote.close()
+        if resp[1] != 0:
+            raise RuntimeError(f'Upstream SOCKS5 вернул код ошибки: {resp[1]}')
 
-    def _forward_data(self, client_sock, remote_sock, client_addr):
+        return True
+
+    @staticmethod
+    def forward_stream(client_sock, remote_sock, client_addr):
         try:
             while True:
                 rlist, _, _ = select.select([client_sock, remote_sock], [], [], TIMEOUT)
@@ -247,6 +235,198 @@ class Socks5Handler(socketserver.StreamRequestHandler):
                     client_sock.sendall(data)
         except Exception as e:
             logger.error(f"[!] Ошибка пересылки: {e}")
+
+
+class Socks5Handler(socketserver.StreamRequestHandler):
+    def handle(self):
+        client_addr = self.client_address
+        start_time = time.time()
+
+        with stats.lock:
+            stats.active_connections += 1
+
+        logger.info(f"[+] Подключение от {client_addr[0]}:{client_addr[1]}")
+
+        try:
+            self.request.settimeout(TIMEOUT)
+            probe = self.request.recv(1, socket.MSG_PEEK)
+
+            if not probe:
+                return
+
+            if probe == b'\x05':
+                self._handle_socks5(client_addr)
+            else:
+                self._handle_http(client_addr)
+
+        except Exception as e:
+            logger.error(f"[!] Ошибка: {e}")
+        finally:
+            self.request.close()
+            with stats.lock:
+                stats.active_connections -= 1
+            logger.info(f"[-] Отключение {client_addr} (время: {time.time() - start_time:.2f}с)")
+
+    def _handle_http(self, client_addr):
+        request = self._read_http_request()
+        if not request:
+            return
+
+        header_lines = request.split('\r\n')
+        first_line = header_lines[0].strip() if header_lines else ''
+
+        if first_line.upper().startswith('CONNECT '):
+            target = first_line.split()[1]
+            if ':' not in target:
+                self.request.sendall(b'HTTP/1.1 400 Bad Request\r\n\r\n')
+                return
+
+            host, port_str = target.rsplit(':', 1)
+            try:
+                port = int(port_str)
+            except ValueError:
+                self.request.sendall(b'HTTP/1.1 400 Bad Request\r\n\r\n')
+                return
+
+            if AUTH_REQUIRED and not self._check_http_auth(header_lines):
+                self.request.sendall(b'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="UniversalProxy"\r\n\r\n')
+                return
+
+            try:
+                remote, proxy_str = ProxyTunnel.connect_upstream()
+                ProxyTunnel.socks5_connect(remote, host, port)
+                self.request.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+                ProxyTunnel.forward_stream(self.request, remote, client_addr)
+            except Exception as e:
+                logger.error(f"[!] HTTP CONNECT ошибка: {e}")
+                self.request.sendall(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
+            finally:
+                try:
+                    remote.close()
+                except Exception:
+                    pass
+            return
+
+        self.request.sendall(b'HTTP/1.1 405 Method Not Allowed\r\n\r\n')
+
+    def _read_http_request(self):
+        header = bytearray()
+        while b'\r\n\r\n' not in header:
+            chunk = self.request.recv(4096)
+            if not chunk:
+                return None
+            header.extend(chunk)
+            if len(header) > 65536:
+                return None
+        return header.decode('latin-1', errors='replace')
+
+    def _check_http_auth(self, lines):
+        for line in lines:
+            if line.lower().startswith('proxy-authorization:'):
+                auth_value = line.split(':', 1)[1].strip()
+                if not auth_value:
+                    return False
+                try:
+                    decoded = base64.b64decode(auth_value.split()[-1]).decode('utf-8')
+                    username, password = decoded.split(':', 1)
+                    return username == USERNAME and password == PASSWORD
+                except Exception:
+                    return False
+        return False
+
+    def _handle_socks5(self, client_addr):
+        try:
+            ver = read_exact(self.request, 1)
+            if not ver or ver != b'\x05':
+                return
+
+            nmethods = read_exact(self.request, 1)
+            if not nmethods:
+                return
+
+            methods = read_exact(self.request, nmethods[0])
+            if not methods:
+                return
+
+            if AUTH_REQUIRED and 0x02 not in methods:
+                self.request.sendall(b'\x05\xff')
+                return
+
+            if AUTH_REQUIRED:
+                self.request.sendall(b'\x05\x02')
+                ver_auth = read_exact(self.request, 1)
+                if not ver_auth or ver_auth != b'\x01':
+                    return
+
+                username_len = read_exact(self.request, 1)
+                if not username_len:
+                    return
+                username = read_exact(self.request, username_len[0]).decode('utf-8', errors='replace')
+                password_len = read_exact(self.request, 1)
+                if not password_len:
+                    return
+                password = read_exact(self.request, password_len[0]).decode('utf-8', errors='replace')
+
+                if username != USERNAME or password != PASSWORD:
+                    self.request.sendall(b'\x01\x01')
+                    return
+
+                self.request.sendall(b'\x01\x00')
+
+            version = read_exact(self.request, 1)
+            if not version or version != b'\x05':
+                return
+
+            cmd = read_exact(self.request, 1)
+            if not cmd:
+                return
+            if cmd[0] != 0x01:
+                self.request.sendall(b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00')
+                return
+
+            reserved = read_exact(self.request, 1)
+            if not reserved or reserved != b'\x00':
+                return
+
+            atyp = read_exact(self.request, 1)
+            if not atyp:
+                return
+            atyp = atyp[0]
+
+            if atyp == 0x01:
+                addr = socket.inet_ntoa(read_exact(self.request, 4))
+                host = addr
+            elif atyp == 0x03:
+                length = read_exact(self.request, 1)
+                if not length:
+                    return
+                host = read_exact(self.request, length[0]).decode('utf-8', errors='replace')
+            elif atyp == 0x04:
+                self.request.sendall(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00')
+                return
+            else:
+                self.request.sendall(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00')
+                return
+
+            port = struct.unpack('>H', read_exact(self.request, 2))[0]
+
+            remote, proxy_str = ProxyTunnel.connect_upstream()
+            ProxyTunnel.socks5_connect(remote, host, port)
+
+            self.request.sendall(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
+            ProxyTunnel.forward_stream(self.request, remote, client_addr)
+        except Exception as e:
+            logger.error(f"[!] SOCKS5 ошибка: {e}")
+            try:
+                self.request.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
+            except Exception:
+                pass
+        finally:
+            try:
+                remote.close()
+            except Exception:
+                pass
+
 
 # ================== ВЕБ-ИНТЕРФЕЙС ==================
 from flask import Flask, jsonify, render_template_string
@@ -299,15 +479,18 @@ HTML = """
 </html>
 """
 
+
 @app.route('/')
 def index():
     with open(LOG_FILE, 'r', encoding='utf-8') as f:
         logs = f.readlines()[-30:]
     return render_template_string(HTML, stats=stats.get_stats(), logs=logs)
 
+
 @app.route('/api/stats')
 def api_stats():
     return jsonify(stats.get_stats())
+
 
 @app.route('/api/rotate')
 def api_rotate():
@@ -315,18 +498,22 @@ def api_rotate():
     proxy = rotator.get_next()
     return jsonify({'status': 'ok', 'proxy': proxy})
 
+
 # ================== ЗАПУСК ==================
 if __name__ == "__main__":
-    # Запускаем веб-интерфейс в отдельном потоке
-    web_thread = threading.Thread(target=app.run, kwargs={'host': '0.0.0.0', 'port': WEB_PORT, 'debug': False, 'threaded': True}, daemon=True)
+    web_thread = threading.Thread(
+        target=app.run,
+        kwargs={'host': '0.0.0.0', 'port': WEB_PORT, 'debug': False, 'threaded': True},
+        daemon=True
+    )
     web_thread.start()
     logger.info(f"[+] Веб-интерфейс: http://localhost:{WEB_PORT}")
 
-    # ВЫБИРАЕМ ПЕРВЫЙ ПРОКСИ ПРИ СТАРТЕ
-    rotator.get_next()
+    if rotator.proxies:
+        rotator.get_next()
 
-    # Запускаем прокси
     server = socketserver.ThreadingTCPServer((HOST, PROXY_PORT), Socks5Handler)
+    server.daemon_threads = True
     logger.info(f"[+] Прокси запущен на порту {PROXY_PORT}")
     logger.info(f"[+] Ротация: {ROTATION_INTERVAL} секунд")
     try:
