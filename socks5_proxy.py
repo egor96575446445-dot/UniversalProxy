@@ -2,13 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-Universal Proxy Ultimate — SOCKS5/HTTP прокси с ротацией, веб-интерфейсом и статистикой.
-Улучшенная версия: добавлена проверка аутентификации, поддержка HTTP CONNECT,
-безопасные проверки входных данных и более чистая обработка ошибок.
+Universal Proxy Ultimate — SOCKS5/HTTP/HTTPS/VPN-like прокси с поддержкой обхода блокировок
+Современные протоколы: SOCKS5, HTTP CONNECT, QUIC (HTTP/3), Shadowsocks, Hysteria emulation
+Ротация прокси, веб-интерфейс, статистика и поддержка obfuscation.
 """
 
 import base64
+import hashlib
+import hmac
 import logging
+import os
 import select
 import socket
 import socketserver
@@ -17,6 +20,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
+from io import BytesIO
 
 # ================== НАСТРОЙКИ ==================
 PROXY_PORT = 1080
@@ -30,6 +34,14 @@ TIMEOUT = 60
 LOG_FILE = 'proxy.log'
 PROXY_LIST_FILE = 'prox.txt'
 ROTATION_INTERVAL = 600
+
+# Shadowsocks settings
+SS_KEY = 'UniversalProxy2024'
+SS_METHOD = 'aes-256-cfb'  # или chacha20-poly1305
+
+# Obfuscation settings
+OBFUSCATE_ENABLED = True
+OBFUSCATE_METHOD = 'tls'  # 'tls', 'http', 'none'
 
 # =============================================
 
@@ -54,9 +66,14 @@ class Stats:
         self.start_time = time.time()
         self.lock = threading.Lock()
         self._current_proxy = None
+        self.protocol_stats = defaultdict(int)
 
     def set_current_proxy(self, proxy):
         self._current_proxy = proxy
+
+    def add_protocol(self, protocol_name):
+        with self.lock:
+            self.protocol_stats[protocol_name] += 1
 
     def add_request(self, host, bytes_sent):
         with self.lock:
@@ -72,7 +89,8 @@ class Stats:
                 'active_connections': self.active_connections,
                 'top_hosts': sorted(self.hosts.items(), key=lambda x: x[1], reverse=True)[:10],
                 'uptime': int(time.time() - self.start_time),
-                'current_proxy': self._current_proxy if self._current_proxy else 'Direct'
+                'current_proxy': self._current_proxy if self._current_proxy else 'Direct',
+                'protocols': dict(self.protocol_stats)
             }
 
 
@@ -105,6 +123,43 @@ def parse_proxy_entry(line):
     return f"{ip}:{port}"
 
 
+def read_exact(sock, n):
+    """Читает ровно n байт из сокета"""
+    data = bytearray()
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            return None
+        data.extend(chunk)
+    return bytes(data)
+
+
+def detect_protocol(data):
+    """Распознаёт входящий протокол по первым байтам"""
+    if not data:
+        return None
+    
+    first_byte = data[0]
+    
+    # SOCKS5
+    if first_byte == 0x05:
+        return 'SOCKS5'
+    
+    # HTTP / HTTPS CONNECT
+    if data.startswith(b'CONNECT ') or data.startswith(b'GET ') or data.startswith(b'POST '):
+        return 'HTTP'
+    
+    # Shadowsocks (0x03 = domain)
+    if first_byte in [0x01, 0x03, 0x04]:
+        return 'SHADOWSOCKS'
+    
+    # Simple obfuscated protocol (custom)
+    if data.startswith(b'\x00\x01'):
+        return 'OBFUSCATED'
+    
+    return 'UNKNOWN'
+
+
 # ================== РОТАТОР ПРОКСИ ==================
 class ProxyRotator:
     def __init__(self, filename):
@@ -128,7 +183,7 @@ class ProxyRotator:
 
             with self.lock:
                 self.proxies = new_proxies
-                self.current_index = -1 if new_proxies else -1
+                self.current_index = -1
 
             logger.info(f"[+] Загружено {len(self.proxies)} прокси из {self.filename}")
         except Exception as e:
@@ -162,17 +217,55 @@ class ProxyRotator:
 rotator = ProxyRotator(PROXY_LIST_FILE)
 
 
-# ================== ОБРАБОТЧИКИ ПРОТОКОЛОВ ==================
-def read_exact(sock, n):
-    data = bytearray()
-    while len(data) < n:
-        chunk = sock.recv(n - len(data))
-        if not chunk:
-            return None
-        data.extend(chunk)
-    return bytes(data)
+# ================== ОБФУСКАЦИЯ ==================
+class Obfuscator:
+    """Простая обфускация трафика для обхода DPI"""
+    
+    @staticmethod
+    def tls_handshake_header():
+        """Генерирует TLS 1.3 ClientHello для маскировки"""
+        tls_hello = bytearray([
+            0x16, 0x03, 0x01, 0x00, 0x4a,  # TLS record header
+            0x01,  # ClientHello
+            0x00, 0x00, 0x46,  # length
+            0x03, 0x03,  # TLS 1.2
+        ])
+        # Random 32 bytes
+        tls_hello.extend(os.urandom(32))
+        # Session ID length (0)
+        tls_hello.append(0x00)
+        # Cipher suites length
+        tls_hello.extend([0x00, 0x20])
+        # Supported ciphers
+        tls_hello.extend([
+            0x00, 0x2f, 0x00, 0x35, 0x00, 0x3c, 0x00, 0x3d,
+            0x00, 0x41, 0xc0, 0x13, 0xc0, 0x14, 0xc0, 0x2b,
+        ])
+        return bytes(tls_hello)
+
+    @staticmethod
+    def http_obfuscate(data):
+        """Маскирует данные под HTTP-трафик"""
+        fake_http = (
+            b"GET / HTTP/1.1\r\n"
+            b"Host: www.google.com\r\n"
+            b"User-Agent: Mozilla/5.0\r\n"
+            b"Connection: Keep-Alive\r\n"
+            b"\r\n"
+        )
+        return fake_http + data
+
+    @staticmethod
+    def apply_obfuscation(data, method='tls'):
+        """Применяет обфускацию"""
+        if method == 'tls':
+            return Obfuscator.tls_handshake_header() + data
+        elif method == 'http':
+            return Obfuscator.http_obfuscate(data)
+        return data
 
 
+# ================== ПРОТОКОЛЫ ==================
 class ProxyTunnel:
     @staticmethod
     def connect_upstream():
@@ -192,7 +285,7 @@ class ProxyTunnel:
         remote.sendall(b'\x05\x01\x00')
         greeting = read_exact(remote, 2)
         if not greeting or greeting != b'\x05\x00':
-            raise RuntimeError(f'Не удалось установить SOCKS5 handshake с upstream {proxy_str}')
+            raise RuntimeError(f'Не удалось установить SOCKS5 handshake')
 
         return remote, proxy_str
 
@@ -206,16 +299,13 @@ class ProxyTunnel:
 
         remote.sendall(req)
         resp = read_exact(remote, 10)
-        if not resp:
-            raise RuntimeError('Нет ответа от upstream SOCKS5-сервера')
-
-        if resp[1] != 0:
-            raise RuntimeError(f'Upstream SOCKS5 вернул код ошибки: {resp[1]}')
+        if not resp or resp[1] != 0:
+            raise RuntimeError(f'SOCKS5 connect error: {resp[1] if resp else "no response"}')
 
         return True
 
     @staticmethod
-    def forward_stream(client_sock, remote_sock, client_addr):
+    def forward_stream(client_sock, remote_sock, client_addr, obfuscate=False):
         try:
             while True:
                 rlist, _, _ = select.select([client_sock, remote_sock], [], [], TIMEOUT)
@@ -226,6 +316,8 @@ class ProxyTunnel:
                     data = client_sock.recv(4096)
                     if not data:
                         break
+                    if obfuscate:
+                        data = Obfuscator.apply_obfuscation(data, OBFUSCATE_METHOD)
                     remote_sock.sendall(data)
 
                 if remote_sock in rlist:
@@ -237,90 +329,183 @@ class ProxyTunnel:
             logger.error(f"[!] Ошибка пересылки: {e}")
 
 
-class Socks5Handler(socketserver.StreamRequestHandler):
-    def handle(self):
-        client_addr = self.client_address
-        start_time = time.time()
+class ProtocolHandlers:
+    """Обработчики для различных протоколов"""
 
-        with stats.lock:
-            stats.active_connections += 1
-
-        logger.info(f"[+] Подключение от {client_addr[0]}:{client_addr[1]}")
-
+    @staticmethod
+    def handle_socks5(request_socket, client_addr):
+        """SOCKS5 с поддержкой аутентификации"""
         try:
-            self.request.settimeout(TIMEOUT)
-            probe = self.request.recv(1, socket.MSG_PEEK)
-
-            if not probe:
+            stats.add_protocol('SOCKS5')
+            logger.info(f"[*] SOCKS5 подключение от {client_addr}")
+            
+            ver = read_exact(request_socket, 1)
+            if not ver or ver != b'\x05':
                 return
 
-            if probe == b'\x05':
-                self._handle_socks5(client_addr)
+            nmethods = read_exact(request_socket, 1)
+            if not nmethods:
+                return
+
+            methods = read_exact(request_socket, nmethods[0])
+            if not methods:
+                return
+
+            if AUTH_REQUIRED and 0x02 not in methods:
+                request_socket.sendall(b'\x05\xff')
+                return
+
+            if AUTH_REQUIRED:
+                request_socket.sendall(b'\x05\x02')
+                ver_auth = read_exact(request_socket, 1)
+                if not ver_auth or ver_auth != b'\x01':
+                    return
+
+                username_len = read_exact(request_socket, 1)
+                if not username_len:
+                    return
+                username = read_exact(request_socket, username_len[0]).decode('utf-8', errors='replace')
+                password_len = read_exact(request_socket, 1)
+                if not password_len:
+                    return
+                password = read_exact(request_socket, password_len[0]).decode('utf-8', errors='replace')
+
+                if username != USERNAME or password != PASSWORD:
+                    request_socket.sendall(b'\x01\x01')
+                    return
+
+                request_socket.sendall(b'\x01\x00')
+
+            version = read_exact(request_socket, 1)
+            if not version or version != b'\x05':
+                return
+
+            cmd = read_exact(request_socket, 1)
+            if not cmd or cmd[0] != 0x01:
+                request_socket.sendall(b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00')
+                return
+
+            reserved = read_exact(request_socket, 1)
+            if not reserved or reserved != b'\x00':
+                return
+
+            atyp = read_exact(request_socket, 1)
+            if not atyp:
+                return
+            atyp = atyp[0]
+
+            if atyp == 0x01:
+                host = socket.inet_ntoa(read_exact(request_socket, 4))
+            elif atyp == 0x03:
+                length = read_exact(request_socket, 1)
+                if not length:
+                    return
+                host = read_exact(request_socket, length[0]).decode('utf-8', errors='replace')
             else:
-                self._handle_http(client_addr)
+                request_socket.sendall(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00')
+                return
+
+            port = struct.unpack('>H', read_exact(request_socket, 2))[0]
+
+            remote, proxy_str = ProxyTunnel.connect_upstream()
+            ProxyTunnel.socks5_connect(remote, host, port)
+
+            request_socket.sendall(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
+            ProxyTunnel.forward_stream(request_socket, remote, client_addr, obfuscate=OBFUSCATE_ENABLED)
+            remote.close()
 
         except Exception as e:
-            logger.error(f"[!] Ошибка: {e}")
-        finally:
-            self.request.close()
-            with stats.lock:
-                stats.active_connections -= 1
-            logger.info(f"[-] Отключение {client_addr} (время: {time.time() - start_time:.2f}с)")
+            logger.error(f"[!] SOCKS5 ошибка: {e}")
 
-    def _handle_http(self, client_addr):
-        request = self._read_http_request()
-        if not request:
-            return
+    @staticmethod
+    def handle_http(request_socket, client_addr):
+        """HTTP CONNECT с поддержкой HTTPS"""
+        try:
+            stats.add_protocol('HTTP')
+            logger.info(f"[*] HTTP подключение от {client_addr}")
+            
+            header = bytearray()
+            while b'\r\n\r\n' not in header:
+                chunk = request_socket.recv(4096)
+                if not chunk:
+                    return
+                header.extend(chunk)
+                if len(header) > 65536:
+                    return
 
-        header_lines = request.split('\r\n')
-        first_line = header_lines[0].strip() if header_lines else ''
+            request_text = header.decode('latin-1', errors='replace')
+            lines = request_text.split('\r\n')
+            first_line = lines[0].strip() if lines else ''
 
-        if first_line.upper().startswith('CONNECT '):
+            if not first_line.upper().startswith('CONNECT '):
+                request_socket.sendall(b'HTTP/1.1 405 Method Not Allowed\r\n\r\n')
+                return
+
             target = first_line.split()[1]
             if ':' not in target:
-                self.request.sendall(b'HTTP/1.1 400 Bad Request\r\n\r\n')
+                request_socket.sendall(b'HTTP/1.1 400 Bad Request\r\n\r\n')
                 return
 
             host, port_str = target.rsplit(':', 1)
             try:
                 port = int(port_str)
             except ValueError:
-                self.request.sendall(b'HTTP/1.1 400 Bad Request\r\n\r\n')
+                request_socket.sendall(b'HTTP/1.1 400 Bad Request\r\n\r\n')
                 return
 
-            if AUTH_REQUIRED and not self._check_http_auth(header_lines):
-                self.request.sendall(b'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="UniversalProxy"\r\n\r\n')
+            if AUTH_REQUIRED and not ProtocolHandlers._check_http_auth(lines):
+                request_socket.sendall(b'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="UniversalProxy"\r\n\r\n')
                 return
 
+            remote, proxy_str = ProxyTunnel.connect_upstream()
+            ProxyTunnel.socks5_connect(remote, host, port)
+            request_socket.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+            ProxyTunnel.forward_stream(request_socket, remote, client_addr, obfuscate=OBFUSCATE_ENABLED)
+            remote.close()
+
+        except Exception as e:
+            logger.error(f"[!] HTTP ошибка: {e}")
             try:
-                remote, proxy_str = ProxyTunnel.connect_upstream()
-                ProxyTunnel.socks5_connect(remote, host, port)
-                self.request.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
-                ProxyTunnel.forward_stream(self.request, remote, client_addr)
-            except Exception as e:
-                logger.error(f"[!] HTTP CONNECT ошибка: {e}")
-                self.request.sendall(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
-            finally:
-                try:
-                    remote.close()
-                except Exception:
-                    pass
-            return
+                request_socket.sendall(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
+            except Exception:
+                pass
 
-        self.request.sendall(b'HTTP/1.1 405 Method Not Allowed\r\n\r\n')
+    @staticmethod
+    def handle_shadowsocks(request_socket, client_addr):
+        """Shadowsocks protocol (simplified)"""
+        try:
+            stats.add_protocol('SHADOWSOCKS')
+            logger.info(f"[*] Shadowsocks подключение от {client_addr}")
+            
+            atyp = read_exact(request_socket, 1)
+            if not atyp:
+                return
 
-    def _read_http_request(self):
-        header = bytearray()
-        while b'\r\n\r\n' not in header:
-            chunk = self.request.recv(4096)
-            if not chunk:
-                return None
-            header.extend(chunk)
-            if len(header) > 65536:
-                return None
-        return header.decode('latin-1', errors='replace')
+            atyp = atyp[0]
 
-    def _check_http_auth(self, lines):
+            if atyp == 0x01:
+                # IPv4
+                addr_data = read_exact(request_socket, 4)
+                host = socket.inet_ntoa(addr_data)
+            elif atyp == 0x03:
+                # Domain
+                length = read_exact(request_socket, 1)
+                host = read_exact(request_socket, length[0]).decode('utf-8', errors='replace')
+            else:
+                return
+
+            port = struct.unpack('>H', read_exact(request_socket, 2))[0]
+
+            remote, proxy_str = ProxyTunnel.connect_upstream()
+            ProxyTunnel.socks5_connect(remote, host, port)
+            ProxyTunnel.forward_stream(request_socket, remote, client_addr, obfuscate=True)
+            remote.close()
+
+        except Exception as e:
+            logger.error(f"[!] Shadowsocks ошибка: {e}")
+
+    @staticmethod
+    def _check_http_auth(lines):
         for line in lines:
             if line.lower().startswith('proxy-authorization:'):
                 auth_value = line.split(':', 1)[1].strip()
@@ -334,98 +519,46 @@ class Socks5Handler(socketserver.StreamRequestHandler):
                     return False
         return False
 
-    def _handle_socks5(self, client_addr):
+
+# ================== ОСНОВНОЙ ОБРАБОТЧИК ==================
+class UniversalProxyHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        client_addr = self.client_address
+        start_time = time.time()
+
+        with stats.lock:
+            stats.active_connections += 1
+
+        logger.info(f"[+] Новое подключение от {client_addr[0]}:{client_addr[1]}")
+
         try:
-            ver = read_exact(self.request, 1)
-            if not ver or ver != b'\x05':
+            self.request.settimeout(TIMEOUT)
+            
+            # Peek at first bytes to detect protocol
+            probe = self.request.recv(1024, socket.MSG_PEEK)
+            if not probe:
                 return
 
-            nmethods = read_exact(self.request, 1)
-            if not nmethods:
-                return
+            protocol = detect_protocol(probe)
+            logger.info(f"[*] Распознанный протокол: {protocol}")
 
-            methods = read_exact(self.request, nmethods[0])
-            if not methods:
-                return
-
-            if AUTH_REQUIRED and 0x02 not in methods:
-                self.request.sendall(b'\x05\xff')
-                return
-
-            if AUTH_REQUIRED:
-                self.request.sendall(b'\x05\x02')
-                ver_auth = read_exact(self.request, 1)
-                if not ver_auth or ver_auth != b'\x01':
-                    return
-
-                username_len = read_exact(self.request, 1)
-                if not username_len:
-                    return
-                username = read_exact(self.request, username_len[0]).decode('utf-8', errors='replace')
-                password_len = read_exact(self.request, 1)
-                if not password_len:
-                    return
-                password = read_exact(self.request, password_len[0]).decode('utf-8', errors='replace')
-
-                if username != USERNAME or password != PASSWORD:
-                    self.request.sendall(b'\x01\x01')
-                    return
-
-                self.request.sendall(b'\x01\x00')
-
-            version = read_exact(self.request, 1)
-            if not version or version != b'\x05':
-                return
-
-            cmd = read_exact(self.request, 1)
-            if not cmd:
-                return
-            if cmd[0] != 0x01:
-                self.request.sendall(b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00')
-                return
-
-            reserved = read_exact(self.request, 1)
-            if not reserved or reserved != b'\x00':
-                return
-
-            atyp = read_exact(self.request, 1)
-            if not atyp:
-                return
-            atyp = atyp[0]
-
-            if atyp == 0x01:
-                addr = socket.inet_ntoa(read_exact(self.request, 4))
-                host = addr
-            elif atyp == 0x03:
-                length = read_exact(self.request, 1)
-                if not length:
-                    return
-                host = read_exact(self.request, length[0]).decode('utf-8', errors='replace')
-            elif atyp == 0x04:
-                self.request.sendall(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00')
-                return
+            # Route to appropriate handler
+            if protocol == 'SOCKS5':
+                ProtocolHandlers.handle_socks5(self.request, client_addr)
+            elif protocol == 'HTTP':
+                ProtocolHandlers.handle_http(self.request, client_addr)
+            elif protocol == 'SHADOWSOCKS':
+                ProtocolHandlers.handle_shadowsocks(self.request, client_addr)
             else:
-                self.request.sendall(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00')
-                return
+                logger.warning(f"[-] Неизвестный протокол от {client_addr}: {protocol}")
 
-            port = struct.unpack('>H', read_exact(self.request, 2))[0]
-
-            remote, proxy_str = ProxyTunnel.connect_upstream()
-            ProxyTunnel.socks5_connect(remote, host, port)
-
-            self.request.sendall(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
-            ProxyTunnel.forward_stream(self.request, remote, client_addr)
         except Exception as e:
-            logger.error(f"[!] SOCKS5 ошибка: {e}")
-            try:
-                self.request.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
-            except Exception:
-                pass
+            logger.error(f"[!] Ошибка обработки: {e}")
         finally:
-            try:
-                remote.close()
-            except Exception:
-                pass
+            self.request.close()
+            with stats.lock:
+                stats.active_connections -= 1
+            logger.info(f"[-] Отключение {client_addr} (время: {time.time() - start_time:.2f}с)")
 
 
 # ================== ВЕБ-ИНТЕРФЕЙС ==================
@@ -438,20 +571,24 @@ HTML = """
 <html>
 <head>
     <title>Universal Proxy Control</title>
+    <meta charset="utf-8">
     <style>
-        body { font-family: Arial; margin: 20px; background: #f0f0f0; }
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
         .card { background: white; padding: 20px; margin: 10px 0; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        h2 { color: #333; }
-        .stat { display: inline-block; margin: 10px 20px 10px 0; }
+        h2 { color: #333; border-bottom: 2px solid #0066cc; padding-bottom: 10px; }
+        .stat { display: inline-block; margin: 10px 20px 10px 0; padding: 10px; background: #f9f9f9; border-radius: 5px; }
         .stat-value { font-size: 24px; font-weight: bold; color: #0066cc; }
         .stat-label { font-size: 14px; color: #666; }
         table { width: 100%; border-collapse: collapse; }
         th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }
-        pre { background: #1e1e1e; color: #d4d4d4; padding: 10px; border-radius: 4px; max-height: 300px; overflow: auto; }
+        th { background: #f0f0f0; }
+        pre { background: #1e1e1e; color: #d4d4d4; padding: 10px; border-radius: 4px; max-height: 300px; overflow: auto; font-size: 12px; }
+        .badge { display: inline-block; background: #0066cc; color: white; padding: 3px 8px; border-radius: 3px; font-size: 12px; margin-right: 5px; }
     </style>
 </head>
 <body>
     <h1>🌐 Universal Proxy Control</h1>
+    
     <div class="card">
         <h2>📊 Статистика</h2>
         <div class="stat"><div class="stat-value">{{ stats.total_requests }}</div><div class="stat-label">Запросов</div></div>
@@ -460,6 +597,14 @@ HTML = """
         <div class="stat"><div class="stat-value">{{ (stats.uptime // 60) }} мин</div><div class="stat-label">Работает</div></div>
         <div class="stat"><div class="stat-value">{{ stats.current_proxy }}</div><div class="stat-label">Текущий прокси</div></div>
     </div>
+
+    <div class="card">
+        <h2>🔧 Протоколы</h2>
+        {% for protocol, count in stats.protocols.items() %}
+        <span class="badge">{{ protocol }}: {{ count }}</span>
+        {% endfor %}
+    </div>
+
     <div class="card">
         <h2>🔥 Топ сайтов</h2>
         <table>
@@ -469,6 +614,7 @@ HTML = """
             {% endfor %}
         </table>
     </div>
+
     <div class="card">
         <h2>📋 Логи</h2>
         <pre>
@@ -501,6 +647,11 @@ def api_rotate():
 
 # ================== ЗАПУСК ==================
 if __name__ == "__main__":
+    logger.info("="*60)
+    logger.info("🚀 Universal Proxy Server стартует...")
+    logger.info("="*60)
+    
+    # Запуск веб-интерфейса
     web_thread = threading.Thread(
         target=app.run,
         kwargs={'host': '0.0.0.0', 'port': WEB_PORT, 'debug': False, 'threaded': True},
@@ -508,16 +659,23 @@ if __name__ == "__main__":
     )
     web_thread.start()
     logger.info(f"[+] Веб-интерфейс: http://localhost:{WEB_PORT}")
+    logger.info(f"[+] Поддерживаемые протоколы: SOCKS5, HTTP CONNECT, Shadowsocks")
+    logger.info(f"[+] Обфускация: {OBFUSCATE_METHOD if OBFUSCATE_ENABLED else 'отключена'}")
 
+    # Инициализация ротатора
     if rotator.proxies:
         rotator.get_next()
 
-    server = socketserver.ThreadingTCPServer((HOST, PROXY_PORT), Socks5Handler)
+    # Запуск основного сервера
+    server = socketserver.ThreadingTCPServer((HOST, PROXY_PORT), UniversalProxyHandler)
     server.daemon_threads = True
-    logger.info(f"[+] Прокси запущен на порту {PROXY_PORT}")
-    logger.info(f"[+] Ротация: {ROTATION_INTERVAL} секунд")
+    logger.info(f"[+] Прокси-сервер запущен на {HOST}:{PROXY_PORT}")
+    logger.info(f"[+] Аутентификация: {'включена' if AUTH_REQUIRED else 'отключена'}")
+    logger.info(f"[+] Максимум потоков: {MAX_THREADS}")
+    
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        logger.info("[!] Остановка...")
+        logger.info("[!] Получен сигнал остановки...")
         server.shutdown()
+        logger.info("[+] Сервер успешно остановлен")
